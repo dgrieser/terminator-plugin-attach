@@ -1,0 +1,133 @@
+#!/usr/bin/env python
+"""Control shared Terminator terminals from the same user account."""
+
+import argparse
+import base64
+import json
+import os
+import select
+import socket
+import sys
+import termios
+import tty
+
+SOCKET_NAME = 'terminator-attach.sock'
+
+
+def get_socket_path():
+    runtime_dir = os.environ.get('XDG_RUNTIME_DIR')
+    if not runtime_dir:
+        candidate = '/run/user/%s' % os.getuid()
+        if os.path.isdir(candidate):
+            runtime_dir = candidate
+    if not runtime_dir:
+        runtime_dir = os.path.join('/tmp', 'terminator-%s' % os.getuid())
+    return os.path.join(runtime_dir, SOCKET_NAME)
+
+
+def request(command, uuid=None):
+    payload = {'command': command}
+    if uuid:
+        payload['uuid'] = uuid
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(get_socket_path())
+    stream = sock.makefile('rwb')
+    stream.write((json.dumps(payload, separators=(',', ':')) + '\n').encode('utf-8'))
+    stream.flush()
+    response = json.loads(stream.readline().decode('utf-8'))
+    return sock, stream, response
+
+
+def print_list(sessions):
+    for item in sessions:
+        state = 'attached' if item['attached'] else 'available'
+        print('%s\t%s\t%dx%d\t%s\t%s' % (
+            item['uuid'],
+            state,
+            item['columns'],
+            item['rows'],
+            item.get('cwd') or '',
+            item.get('title') or item.get('window_title') or '',
+        ))
+
+
+def paint(snapshot):
+    text = snapshot.get('text', '')
+    cursor_row = int(snapshot.get('cursor_row', 0)) + 1
+    cursor_col = int(snapshot.get('cursor_col', 0)) + 1
+    sys.stdout.write('\x1b[?25l\x1b[H\x1b[2J')
+    sys.stdout.write(text)
+    sys.stdout.write('\x1b[%d;%dH\x1b[?25h' % (cursor_row, cursor_col))
+    sys.stdout.flush()
+
+
+def connect(uuid):
+    sock, stream, response = request('connect', uuid)
+    if not response.get('ok'):
+        sys.exit(response.get('error', 'connect failed'))
+
+    old_term = termios.tcgetattr(sys.stdin)
+    tty.setraw(sys.stdin.fileno())
+    sock.setblocking(False)
+    buffer = b''
+    try:
+        while True:
+            readable, _, _ = select.select([sys.stdin, sock], [], [])
+            if sys.stdin in readable:
+                data = os.read(sys.stdin.fileno(), 4096)
+                if not data:
+                    break
+                frame = {
+                    'input': base64.b64encode(data).decode('ascii'),
+                }
+                sock.sendall((json.dumps(frame, separators=(',', ':')) + '\n').encode('utf-8'))
+            if sock in readable:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b'\n' in buffer:
+                    line, buffer = buffer.split(b'\n', 1)
+                    if not line:
+                        continue
+                    event = json.loads(line.decode('utf-8'))
+                    if event.get('event') == 'snapshot':
+                        paint(event)
+                    elif event.get('event') == 'closed':
+                        return
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+        sys.stdout.write('\x1b[?25h\n')
+        sys.stdout.flush()
+        sock.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='List and control shared Terminator terminals.'
+    )
+    sub = parser.add_subparsers(dest='command')
+    sub.add_parser('list')
+    for name in ('share', 'unshare', 'connect', 'disconnect'):
+        cmd = sub.add_parser(name)
+        cmd.add_argument('uuid')
+    args = parser.parse_args()
+    if not args.command:
+        parser.error('command is required')
+
+    if args.command == 'connect':
+        connect(args.uuid)
+        return
+
+    _sock, stream, response = request(args.command, getattr(args, 'uuid', None))
+    if not response.get('ok'):
+        sys.exit(response.get('error', 'command failed'))
+    if args.command == 'list':
+        print_list(response['sessions'])
+    else:
+        print('ok')
+    stream.close()
+
+
+if __name__ == '__main__':
+    main()
